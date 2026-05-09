@@ -1011,33 +1011,13 @@ def _buy_from_receipt(tx_hash: str, receipt: Dict[str, Any], *, allow_live_eth_f
     if not buyer:
         return None
 
-    # Fetch tx early so we can use tx.from for smart wallet / AA wallet detection
-    tx_from_early = ""
-    eth_value_int_early = 0
-    try:
-        tx_early = _get_tx(tx_hash)
-        tx_from_early = _norm(tx_early.get("from", ""))
-        eth_value_int_early = int(tx_early.get("value", "0x0"), 16)
-    except Exception:
-        tx_early = None
-
-    # If final receiver is a contract (smart wallet, AA, router), try to use tx.from instead.
-    # This handles Coinbase Smart Wallet, Safe, and similar patterns where the EOA initiates
-    # the tx but tokens land in the contract address.
+    # If final receiver is a contract, it is not a personal buy
     if _is_contract(buyer, block_number):
-        if tx_from_early and not _is_contract(tx_from_early, block_number):
-            # Remap buyer to tx.from (the real human); tokens may sit in their smart wallet
-            buyer = tx_from_early
-        # else: both are contracts (bundler/relayer) — allow through, validated below by spent_usd
+        return None
 
     tokens_delta_int = int(tdel.get(buyer, 0))
-    # If the remapped buyer (tx.from) has no direct token delta, fall back to the original
-    # max-inflow address (tokens landed in their smart wallet contract, not the EOA directly)
     if tokens_delta_int <= 0:
-        original_buyer = _pick_final_buyer(tdel, exclude)
-        tokens_delta_int = int(tdel.get(original_buyer, 0)) if original_buyer else 0
-        if tokens_delta_int <= 0:
-            return None
+        return None
 
     tokens_bought = _dec(tokens_delta_int, TOKEN_DECIMALS)
 
@@ -1071,9 +1051,15 @@ def _buy_from_receipt(tx_hash: str, receipt: Dict[str, Any], *, allow_live_eth_f
     usdt_spent = 0.0
     weth_spent = 0.0
 
-    # Reuse tx data already fetched above (smart wallet detection step).
-    tx_from = tx_from_early
-    eth_value_int = eth_value_int_early
+    # Always fetch tx once. We use tx.value to decide the payment path.
+    tx_from = ""
+    eth_value_int = 0
+    try:
+        tx = _get_tx(tx_hash)
+        tx_from = _norm(tx.get("from", ""))
+        eth_value_int = int(tx.get("value", "0x0"), 16)
+    except Exception:
+        tx = None
 
     # If the tx paid native ETH (tx.value > 0), treat this as an ETH-paid buy.
     # In that case, ignore any USDC/USDT movements inside the tx (they can be pool
@@ -2003,7 +1989,7 @@ _STATS_CACHE: Dict[str, Any] = {"ts": 0, "data": None}
 _STATS_CACHE_TTL = 60  # seconds
 
 def _fetch_stats_balances_batched() -> Dict[str, int]:
-    """Fetch all 6 balanceOf calls for /stats in a single RPC batch."""
+    """Fetch all balanceOf calls for /stats in a single RPC batch."""
     clawdviction_wallet = "0xC9E377FB98a1aA6Ecf4B553cE1b57940121213bf"
     clawdlabs_wallet = "0x85Af18A392E564F68897A0518C191D0831e40a46"
 
@@ -2018,10 +2004,11 @@ def _fetch_stats_balances_batched() -> Dict[str, int]:
         ("eth_call", [{"to": TOKEN_ADDRESS, "data": _bal_data(INCINERATOR_ADDRESS)}, "latest"]),
         ("eth_call", [{"to": TOKEN_ADDRESS, "data": _bal_data(clawdviction_wallet)}, "latest"]),
         ("eth_call", [{"to": TOKEN_ADDRESS, "data": _bal_data(clawdlabs_wallet)}, "latest"]),
+        ("eth_getBalance", [CLAWD_WALLET, "latest"]),
     ]
 
     results = _rpc_batch(calls)
-    keys = ["clawd", "weth", "burned", "incinerator", "clawdviction", "clawdlabs"]
+    keys = ["clawd", "weth", "burned", "incinerator", "clawdviction", "clawdlabs", "eth"]
     out: Dict[str, int] = {}
     for i, k in enumerate(keys):
         raw = results[i] if i < len(results) else "0x0"
@@ -2083,19 +2070,21 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     clawd_amt = _dec(clawd_bal_int, TOKEN_DECIMALS)
     weth_amt = _dec(weth_bal_int, 18)
+    eth_amt = _dec(bals.get("eth", 0), 18)
     burned_amt = _dec(burned_bal_int, TOKEN_DECIMALS)
     incinerator_amt = _dec(incinerator_bal_int, TOKEN_DECIMALS)
     clawdviction_amt = _dec(clawdviction_bal_int, TOKEN_DECIMALS)
     clawdlabs_amt = _dec(clawdlabs_bal_int, TOKEN_DECIMALS)
 
     clawd_usd = (float(price or 0.0)) * clawd_amt
+    eth_usd = (float(wp or 0.0)) * eth_amt
     weth_usd = (float(wp or 0.0)) * weth_amt
     burned_usd = (float(price or 0.0)) * burned_amt
     incinerator_usd = (float(price or 0.0)) * incinerator_amt
     total_staked_amt = clawdviction_amt + clawdlabs_amt
     total_staked_usd = (float(price or 0.0)) * total_staked_amt
 
-    total_value = clawd_usd + weth_usd
+    total_value = clawd_usd + eth_usd + weth_usd
 
     total_supply = 100_000_000_000.0
     burned_pct = (burned_amt / total_supply) * 100.0 if total_supply > 0 else 0.0
@@ -2118,6 +2107,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines.append("<b>🅺 My Wallet</b>")
     lines.append(wallet_html)
     lines.append(f"{_fmt_big(clawd_amt)} KELLY ({_fmt_int_usd(clawd_usd)})")
+    lines.append(f"{_fmt_weth_two(eth_amt)} ETH ({_fmt_int_usd(eth_usd)})")
     lines.append(f"{_fmt_weth_two(weth_amt)} WETH ({_fmt_int_usd(weth_usd)})")
     lines.append(f"Total value: {_fmt_int_usd(total_value)}")
     lines.append("")
