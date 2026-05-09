@@ -1693,11 +1693,13 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text("Failed to fetch receipt for this tx.")
             return
 
-        # 1) Try BUY
+        # 1) Try BUY — with detailed diagnostics on failure
         buy = None
+        buy_err = ""
         try:
-            buy = _buy_from_receipt(tx_hash, receipt)
-        except Exception:
+            buy = _buy_from_receipt(tx_hash, receipt, allow_live_eth_fallback=True)
+        except Exception as e:
+            buy_err = str(e)
             buy = None
 
         if buy:
@@ -1712,6 +1714,66 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await _send_photo_or_text(context.application, user_id, "buy", caption)
             await update.message.reply_text("Buy alert sent in DM.")
             return
+
+        # --- Diagnostics: explain exactly why it was not detected as a buy ---
+        try:
+            diag: List[str] = ["🔍 Buy detection trace:"]
+            block_number = None
+            bn_hex = receipt.get("blockNumber")
+            if isinstance(bn_hex, str) and bn_hex.startswith("0x"):
+                block_number = int(bn_hex, 16)
+
+            token_addresses = {
+                TOKEN_ADDRESS: TOKEN_DECIMALS,
+                USDC_ADDRESS: 6,
+                USDT_ADDRESS: 6,
+                WETH_ADDRESS: 18,
+            }
+            deltas = _aggregate_net_deltas_from_receipt(receipt, token_addresses)
+            tdel = deltas.get(_norm(TOKEN_ADDRESS)) or {}
+
+            if not tdel:
+                diag.append("❌ No token Transfer logs found for this contract")
+            else:
+                diag.append(f"✅ Token deltas found: {len(tdel)} addresses")
+                for addr, d in sorted(tdel.items(), key=lambda x: -abs(x[1]))[:5]:
+                    diag.append(f"  {addr[:10]}… delta={d/10**TOKEN_DECIMALS:.2f}")
+
+            exclude = [TOKEN_ADDRESS, USDC_ADDRESS, USDT_ADDRESS, WETH_ADDRESS, BURN_ADDRESS, STAKING_CONTRACT_ADDRESS]
+            buyer_cand = _pick_final_buyer(tdel, exclude)
+            if not buyer_cand:
+                diag.append("❌ No buyer candidate after excluding known contracts")
+            else:
+                is_c = _is_contract(buyer_cand, block_number)
+                diag.append(f"{'⚠️' if is_c else '✅'} Buyer candidate: {buyer_cand[:12]}… is_contract={is_c}")
+
+            try:
+                tx_dbg = _get_tx(tx_hash)
+                tx_from_dbg = _norm(tx_dbg.get("from", ""))
+                eth_val = int(tx_dbg.get("value", "0x0"), 16)
+                diag.append(f"✅ tx.from: {tx_from_dbg[:12]}… eth_value={eth_val/1e18:.6f} ETH")
+                from_is_c = _is_contract(tx_from_dbg, block_number)
+                diag.append(f"   tx.from is_contract={from_is_c}")
+            except Exception as e:
+                diag.append(f"❌ Failed to fetch tx: {e}")
+
+            weth_del = deltas.get(_norm(WETH_ADDRESS)) or {}
+            usdc_del = deltas.get(_norm(USDC_ADDRESS)) or {}
+            usdt_del = deltas.get(_norm(USDT_ADDRESS)) or {}
+            _, weth_out = _max_outflow_addr(weth_del)
+            _, usdc_out = _max_outflow_addr(usdc_del)
+            _, usdt_out = _max_outflow_addr(usdt_del)
+            diag.append(f"   WETH outflow={weth_out/1e18:.6f}  USDC outflow={usdc_out/1e6:.2f}  USDT outflow={usdt_out/1e6:.2f}")
+
+            price, _ = _token_price_usd_and_fdv(TOKEN_ADDRESS)
+            diag.append(f"   Token price: {price}")
+
+            if buy_err:
+                diag.append(f"❌ Exception: {buy_err}")
+
+            await update.message.reply_text("\n".join(diag))
+        except Exception as de:
+            await update.message.reply_text(f"Diagnostics failed: {de}")
 
         # 2) If not a buy, try stake/burn based on Transfer logs.
         # For /scan <tx_hash>, we send alerts regardless of your min_usd thresholds.
