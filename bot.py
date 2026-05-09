@@ -2116,9 +2116,6 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"{burned_bil:.2f}B KELLY "
         f"({_fmt_int_usd(burned_usd)} · {burned_pct:.2f}%)"
     )
-    lines.append(
-        f"(+{incinerator_bil:.2f}B pending · {incinerator_pct:.2f}%)"
-    )
     lines.append("")
 
     await update.message.reply_text(
