@@ -1011,13 +1011,33 @@ def _buy_from_receipt(tx_hash: str, receipt: Dict[str, Any], *, allow_live_eth_f
     if not buyer:
         return None
 
-    # If final receiver is a contract, it is not a personal buy
+    # Fetch tx early so we can use tx.from for smart wallet / AA wallet detection
+    tx_from_early = ""
+    eth_value_int_early = 0
+    try:
+        tx_early = _get_tx(tx_hash)
+        tx_from_early = _norm(tx_early.get("from", ""))
+        eth_value_int_early = int(tx_early.get("value", "0x0"), 16)
+    except Exception:
+        tx_early = None
+
+    # If final receiver is a contract (smart wallet, AA, router), try to use tx.from instead.
+    # This handles Coinbase Smart Wallet, Safe, and similar patterns where the EOA initiates
+    # the tx but tokens land in the contract address.
     if _is_contract(buyer, block_number):
-        return None
+        if tx_from_early and not _is_contract(tx_from_early, block_number):
+            # Remap buyer to tx.from (the real human); tokens may sit in their smart wallet
+            buyer = tx_from_early
+        # else: both are contracts (bundler/relayer) — allow through, validated below by spent_usd
 
     tokens_delta_int = int(tdel.get(buyer, 0))
+    # If the remapped buyer (tx.from) has no direct token delta, fall back to the original
+    # max-inflow address (tokens landed in their smart wallet contract, not the EOA directly)
     if tokens_delta_int <= 0:
-        return None
+        original_buyer = _pick_final_buyer(tdel, exclude)
+        tokens_delta_int = int(tdel.get(original_buyer, 0)) if original_buyer else 0
+        if tokens_delta_int <= 0:
+            return None
 
     tokens_bought = _dec(tokens_delta_int, TOKEN_DECIMALS)
 
@@ -1051,15 +1071,9 @@ def _buy_from_receipt(tx_hash: str, receipt: Dict[str, Any], *, allow_live_eth_f
     usdt_spent = 0.0
     weth_spent = 0.0
 
-    # Always fetch tx once. We use tx.value to decide the payment path.
-    tx_from = ""
-    eth_value_int = 0
-    try:
-        tx = _get_tx(tx_hash)
-        tx_from = _norm(tx.get("from", ""))
-        eth_value_int = int(tx.get("value", "0x0"), 16)
-    except Exception:
-        tx = None
+    # Reuse tx data already fetched above (smart wallet detection step).
+    tx_from = tx_from_early
+    eth_value_int = eth_value_int_early
 
     # If the tx paid native ETH (tx.value > 0), treat this as an ETH-paid buy.
     # In that case, ignore any USDC/USDT movements inside the tx (they can be pool
