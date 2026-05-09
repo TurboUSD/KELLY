@@ -78,7 +78,7 @@ else:
 # Project specific config (KELLY)
 # =========================
 
-TOKEN_ADDRESS = os.environ.get("TOKEN_CONTRACT_ADDRESS", "0x9f86dB9fc6f7c9408e8Fda3Ff8ce4e78ac7a6b07").strip()
+TOKEN_ADDRESS = os.environ.get("TOKEN_CONTRACT_ADDRESS", "0x50D2280441372486BeecdD328c1854743EBaCb07").strip()
 TOKEN_DECIMALS = int(os.environ.get("TOKEN_DECIMALS", "18"))
 TOTAL_SUPPLY = float(os.environ.get("TOTAL_SUPPLY", "100000000000"))
 
