@@ -49,7 +49,7 @@ WATCH_POLL_SEC = int(os.environ.get("WATCH_POLL_SEC", "300"))
 # Safety clamp to avoid excessive RPC usage
 if WATCH_POLL_SEC < 10:
     WATCH_POLL_SEC = 10
-PRICE_CACHE_TTL_SEC = int(os.environ.get("PRICE_CACHE_TTL_SEC", "120"))  # DexScreener cache TTL
+PRICE_CACHE_TTL_SEC = int(os.environ.get("PRICE_CACHE_TTL_SEC", str(WATCH_POLL_SEC)))  # DexScreener cache TTL
 if PRICE_CACHE_TTL_SEC < 30:
     PRICE_CACHE_TTL_SEC = 30
 MAX_EVENT_AGE_SEC = int(os.environ.get("MAX_EVENT_AGE_SEC", "1800"))
@@ -58,6 +58,7 @@ WATCH_MAX_SEEN_EVENTS = int(os.environ.get("WATCH_MAX_SEEN_EVENTS", "4000"))
 WATCH_CONFIRMATIONS = int(os.environ.get("WATCH_CONFIRMATIONS", "0"))
 RPC_LOG_CHUNK = int(os.environ.get("RPC_LOG_CHUNK", "2000"))
 BLOCKS_PER_DAY = int(os.environ.get("BLOCKS_PER_DAY", "43200"))  # Base ~2s blocks
+RECEIPT_BATCH_SIZE = 75  # Number of eth_getTransactionReceipt calls per _rpc_batch chunk
 
 DATA_PATH = os.environ.get("DATA_PATH") or ("/data" if os.path.isdir("/data") else "/app/data")
 STATE_PATH = os.environ.get("STATE_PATH", os.path.join(DATA_PATH, "watch_state.json"))
@@ -425,9 +426,14 @@ def _rpc(method: str, params: List[Any]) -> Any:
     raise last_err if last_err else RuntimeError(f"_rpc failed: {method}")
 
 
-def _rpc_batch(calls: List[Tuple[str, List[Any]]]) -> List[Any]:
+def _rpc_batch(calls: List[Tuple[str, List[Any]]], _min_chunk: int = 10) -> List[Any]:
     """JSON-RPC batch: send multiple (method, params) in one HTTP request.
-    Returns list of results in same order. Falls back to individual calls on failure."""
+    Returns list of results in same order.
+
+    On repeated failure of the raw batch call, retries with backoff, then
+    recursively splits the batch in half and retries as sub-batches. Only
+    once a chunk is at/below `_min_chunk` and still failing does it fall
+    back to serial `_rpc` calls for that small chunk."""
     if not calls:
         return []
     payloads = [
@@ -449,12 +455,23 @@ def _rpc_batch(calls: List[Tuple[str, List[Any]]]) -> List[Any]:
             return [by_id.get(idx) for idx in range(len(calls))]
         except Exception as e:
             last_err = e
-            time.sleep(0.4 * (attempt + 1))
+            time.sleep(0.5 * (attempt + 1))
+
+    if len(calls) <= _min_chunk:
+        try:
+            print(f"[rpc_batch] batch of {len(calls)} still failing after retries, falling back to serial err={last_err}")
+        except Exception:
+            pass
+        return [_rpc(m, p) for m, p in calls]
+
     try:
-        print(f"[rpc_batch] failed, falling back err={last_err}")
+        print(f"[rpc_batch] batch of {len(calls)} failed after retries err={last_err}, splitting and retrying")
     except Exception:
         pass
-    return [_rpc(m, p) for m, p in calls]
+    mid = len(calls) // 2
+    left = _rpc_batch(calls[:mid], _min_chunk=_min_chunk)
+    right = _rpc_batch(calls[mid:], _min_chunk=_min_chunk)
+    return left + right
 
 
 def _get_code(addr: str, block_tag: str = "latest") -> str:
@@ -838,6 +855,11 @@ def _eth_usd_from_ankr_history(ts: int) -> Optional[float]:
 CHAINLINK_ETH_USD_FEED_BASE = "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70"
 _CL_ETHUSD_DECIMALS: Optional[int] = None
 
+# Cache Chainlink ETH/USD price by block bucket to avoid re-fetching latestRoundData()
+# for every tx in a burst of nearby blocks.
+_CL_ETHUSD_BLOCK_BUCKET = 30
+_CL_ETHUSD_PRICE_CACHE: Dict[int, float] = {}
+
 def _abi_int256_from_32(word: bytes) -> int:
     # word is 32 bytes, two's complement
     as_int = int.from_bytes(word, byteorder="big", signed=False)
@@ -851,6 +873,10 @@ def _chainlink_eth_usd_at_block(block_number: int) -> Optional[float]:
     This uses eth_call with a block tag, so it requires an RPC that can serve historical state (archive).
     """
     global _CL_ETHUSD_DECIMALS
+    bucket = int(block_number) // _CL_ETHUSD_BLOCK_BUCKET
+    cached = _CL_ETHUSD_PRICE_CACHE.get(bucket)
+    if cached is not None:
+        return cached
     try:
         block_tag = hex(int(block_number))
         if _CL_ETHUSD_DECIMALS is None:
@@ -869,7 +895,14 @@ def _chainlink_eth_usd_at_block(block_number: int) -> Optional[float]:
         answer = _abi_int256_from_32(answer_word)
         if answer <= 0:
             return None
-        return float(answer) / (10 ** int(_CL_ETHUSD_DECIMALS))
+        price = float(answer) / (10 ** int(_CL_ETHUSD_DECIMALS))
+
+        # Guard against unbounded growth of the cache.
+        if len(_CL_ETHUSD_PRICE_CACHE) > 5000:
+            _CL_ETHUSD_PRICE_CACHE.clear()
+        _CL_ETHUSD_PRICE_CACHE[bucket] = price
+
+        return price
     except Exception:
         return None
 
@@ -1600,21 +1633,28 @@ async def _scan_and_dm(app, user_id: int, blocks_back: int, min_usd: float) -> N
         ok = 0
         fail = 0
 
-        for i, h in enumerate(tx_hashes, start=1):
-            try:
-                receipt = _get_receipt(h)
-                ok += 1
-                buy = _buy_from_receipt(h, receipt, allow_live_eth_fallback=True)
-                if buy and float(buy["usd"]) >= min_usd:
-                    matches.append((h, buy))
-            except Exception:
-                fail += 1
+        i = 0
+        for chunk_start in range(0, len(tx_hashes), RECEIPT_BATCH_SIZE):
+            chunk = tx_hashes[chunk_start:chunk_start + RECEIPT_BATCH_SIZE]
+            receipts = _rpc_batch([("eth_getTransactionReceipt", [h]) for h in chunk])
 
-            if i % 200 == 0:
-                _send_dm(
-                    f"Progress: {i:,}/{len(tx_hashes):,} ok={ok:,} fail={fail:,} "
-                    f"matches={len(matches):,} elapsed={time.time()-t0:.1f}s"
-                )
+            for h, receipt in zip(chunk, receipts):
+                i += 1
+                try:
+                    if receipt is None:
+                        raise RuntimeError("no receipt")
+                    ok += 1
+                    buy = _buy_from_receipt(h, receipt, allow_live_eth_fallback=True)
+                    if buy and float(buy["usd"]) >= min_usd:
+                        matches.append((h, buy))
+                except Exception:
+                    fail += 1
+
+                if i % 200 == 0:
+                    _send_dm(
+                        f"Progress: {i:,}/{len(tx_hashes):,} ok={ok:,} fail={fail:,} "
+                        f"matches={len(matches):,} elapsed={time.time()-t0:.1f}s"
+                    )
 
         matches.sort(key=lambda x: float(x[1]["usd"]), reverse=True)
 
@@ -2548,6 +2588,10 @@ def _monitor_tick_sync() -> List[Tuple[str, str, str, str]]:
             tx_seen_local.add(tx_hash)
             txs_for_buy.append(tx_hash)
 
+    # Apply prefilter/seen checks first so we only batch-fetch receipts for
+    # hashes we actually need, then fetch those receipts in chunked batches.
+    hashes_to_fetch: List[str] = []
+    buy_ids_to_fetch: List[str] = []
     for h in txs_for_buy:
         if token_price>0:
             est_usd = tx_value_est.get(h,0)*token_price
@@ -2558,40 +2602,50 @@ def _monitor_tick_sync() -> List[Tuple[str, str, str, str]]:
         if buy_id in seen_buy:
             continue
 
-        # Only mark as seen after successful processing (avoid losing events on RPC hiccups)
-        try:
-            receipt = _get_receipt(h)
+        hashes_to_fetch.append(h)
+        buy_ids_to_fetch.append(buy_id)
 
-            # For realtime monitoring, allow a live ETH/USD fallback if historical pricing is unavailable.
-            buy = _buy_from_receipt(h, receipt, allow_live_eth_fallback=True)
-            if buy:
-                usd = float(buy["usd"])
-                if usd >= float(state_min["buy"]):
-                    block_number = int(receipt.get("blockNumber", "0x0"), 16) if receipt.get("blockNumber") else None
-                    if not _event_is_too_old(block_number):
-                        tokens = float(buy["tokens"])
-                        buyer = buy["buyer"]
-                        caption = _event_caption("buy", h, tokens, usd, buyer, pay=buy.get("pay"))
-                        outgoing.append(("buy", buy_id, caption, buyer))
+    for chunk_start in range(0, len(hashes_to_fetch), RECEIPT_BATCH_SIZE):
+        chunk = hashes_to_fetch[chunk_start:chunk_start + RECEIPT_BATCH_SIZE]
+        id_chunk = buy_ids_to_fetch[chunk_start:chunk_start + RECEIPT_BATCH_SIZE]
+        receipts = _rpc_batch([("eth_getTransactionReceipt", [h]) for h in chunk])
 
-                # Mark as seen only if we successfully detected a BUY.
-                seen_buy.add(buy_id)
-                continue
-
-            # Not detected as a buy. If it is a SELL, mark as seen so we don't keep re-processing it.
+        for h, buy_id, receipt in zip(chunk, id_chunk, receipts):
+            # Only mark as seen after successful processing (avoid losing events on RPC hiccups)
             try:
-                sell = _sell_from_receipt(h, receipt)
+                if receipt is None:
+                    raise RuntimeError("no receipt")
+
+                # For realtime monitoring, allow a live ETH/USD fallback if historical pricing is unavailable.
+                buy = _buy_from_receipt(h, receipt, allow_live_eth_fallback=True)
+                if buy:
+                    usd = float(buy["usd"])
+                    if usd >= float(state_min["buy"]):
+                        block_number = int(receipt.get("blockNumber", "0x0"), 16) if receipt.get("blockNumber") else None
+                        if not _event_is_too_old(block_number):
+                            tokens = float(buy["tokens"])
+                            buyer = buy["buyer"]
+                            caption = _event_caption("buy", h, tokens, usd, buyer, pay=buy.get("pay"))
+                            outgoing.append(("buy", buy_id, caption, buyer))
+
+                    # Mark as seen only if we successfully detected a BUY.
+                    seen_buy.add(buy_id)
+                    continue
+
+                # Not detected as a buy. If it is a SELL, mark as seen so we don't keep re-processing it.
+                try:
+                    sell = _sell_from_receipt(h, receipt)
+                except Exception:
+                    sell = None
+
+                if sell:
+                    seen_buy.add(buy_id)
+                    continue
+
+                # If neither buy nor sell, do NOT mark as seen.
+                # This allows a retry within the overlap window (protects against transient RPC/price issues).
             except Exception:
-                sell = None
-
-            if sell:
-                seen_buy.add(buy_id)
                 continue
-
-            # If neither buy nor sell, do NOT mark as seen.
-            # This allows a retry within the overlap window (protects against transient RPC/price issues).
-        except Exception:
-            continue
 
     state["watch"]["last_scanned_block"] = end
     state["watch"]["seen"]["buy"] = _prune_seen(list(seen_buy))
