@@ -162,6 +162,7 @@ DEFAULT_STATE: Dict[str, Any] = {
     "emoji_usd": {"buy": 100.0, "stake": 100.0, "burn": 100.0},
     "alerts_dm": True,
     "buy_media": "video",  # "video" -> assets/Kelly.mp4, "image" -> assets/Kelly.jpeg (change with /setmedia)
+    "buy_media_custom": None,  # {"kind": "video"|"image", "file_id": "..."} set by replying to a media with /setmedia
     "watch": {
         "last_scanned_block": 0,
         "seen": {"buy": [], "stake": [], "burn": []},
@@ -210,6 +211,10 @@ def _load_state() -> Dict[str, Any]:
             merged["watch"]["sent_dm"].update(s["watch"]["sent_dm"])
         if isinstance(s.get("cache"), dict):
             merged["cache"].update(s["cache"])
+        if s.get("buy_media"):
+            merged["buy_media"] = s["buy_media"]
+        if isinstance(s.get("buy_media_custom"), dict):
+            merged["buy_media_custom"] = s["buy_media_custom"]
 
         for k in ("buy", "stake", "burn"):
             merged["watch"]["seen"][k] = list(merged["watch"]["seen"].get(k) or [])
@@ -1355,30 +1360,78 @@ def _classify_transfer_log(log: Dict[str, Any]) -> Optional[Tuple[str, str, str,
 # Telegram helpers
 # =========================
 
+# Buy media preloaded in memory at startup + Telegram file_id cache (after the first
+# upload Telegram keeps the file, so later alerts send by file_id and never re-upload).
+_MEDIA_BYTES: Dict[str, bytes] = {}      # path -> file bytes
+_MEDIA_FILE_ID: Dict[str, str] = {}      # path -> telegram file_id
+
+
+def _preload_buy_media() -> None:
+    for path in (ASSET_BUY_VIDEO, ASSET_BUY_IMAGE):
+        try:
+            if path and os.path.exists(path):
+                with open(path, "rb") as f:
+                    _MEDIA_BYTES[path] = f.read()
+                print(f"[media] preloaded {path} ({len(_MEDIA_BYTES[path]):,} bytes)")
+        except Exception as e:
+            print(f"[media] preload failed {path}: {e!r}")
+
+
+async def _send_buy_media(app, chat_id: int, media_kind: str, src, caption: str) -> Optional[str]:
+    """src = telegram file_id (str) or bytes. Returns the file_id Telegram assigned."""
+    if media_kind == "video":
+        m = await app.bot.send_video(chat_id=chat_id, video=src, caption=caption, parse_mode="HTML", supports_streaming=True)
+        return m.video.file_id if m and m.video else None
+    m = await app.bot.send_photo(chat_id=chat_id, photo=src, caption=caption, parse_mode="HTML")
+    return m.photo[-1].file_id if m and m.photo else None
+
+
 async def _send_photo_or_text(app, chat_id: int, kind: str, caption: str) -> None:
-    """Send the alert with its media. For buys the media is chosen by state["buy_media"]:
-    "video" -> ASSET_BUY_VIDEO (Kelly.mp4), "image" -> ASSET_BUY_IMAGE (Kelly.jpeg).
-    Falls back video -> image -> plain text if a file is missing."""
+    """Send the alert with its media. For buys:
+    1) custom media set by replying to a photo/video with /setmedia (sent by file_id)
+    2) state["buy_media"]: "video" -> Kelly.mp4, "image" -> Kelly.jpeg (memory-preloaded, file_id cached)
+    Falls back video -> image -> plain text."""
     if kind == "buy":
         try:
-            mode = str(_load_state().get("buy_media") or "video").lower()
+            st = _load_state()
         except Exception:
+            st = {}
+        mode = str(st.get("buy_media") or "video").lower()
+        custom = st.get("buy_media_custom") or None
+
+        if mode == "custom" and isinstance(custom, dict) and custom.get("file_id"):
+            try:
+                await _send_buy_media(app, chat_id, custom.get("kind", "image"), custom["file_id"], caption)
+                return
+            except Exception as e:
+                print(f"[send_alert] custom media failed: {e!r}, falling back to assets")
             mode = "video"
+
         candidates = [("video", ASSET_BUY_VIDEO), ("image", ASSET_BUY_IMAGE)]
         if mode == "image":
             candidates.reverse()
         for media_kind, path in candidates:
-            if not path or not os.path.exists(path):
+            if not path:
+                continue
+            src = _MEDIA_FILE_ID.get(path)
+            if src is None:
+                src = _MEDIA_BYTES.get(path)
+            if src is None and os.path.exists(path):
+                try:
+                    with open(path, "rb") as f:
+                        src = _MEDIA_BYTES[path] = f.read()
+                except Exception:
+                    src = None
+            if src is None:
                 continue
             try:
-                with open(path, "rb") as f:
-                    if media_kind == "video":
-                        await app.bot.send_video(chat_id=chat_id, video=f, caption=caption, parse_mode="HTML", supports_streaming=True)
-                    else:
-                        await app.bot.send_photo(chat_id=chat_id, photo=f, caption=caption, parse_mode="HTML")
+                fid = await _send_buy_media(app, chat_id, media_kind, src, caption)
+                if fid:
+                    _MEDIA_FILE_ID[path] = fid
                 return
             except Exception as e:
                 print(f"[send_alert] failed sending {media_kind} {path}: {e!r}")
+                _MEDIA_FILE_ID.pop(path, None)  # stale file_id -> next time re-upload bytes
                 continue
         await app.bot.send_message(chat_id=chat_id, text=caption, parse_mode="HTML", disable_web_page_preview=True)
         return
@@ -1392,28 +1445,63 @@ async def _send_photo_or_text(app, chat_id: int, kind: str, caption: str) -> Non
 
 
 async def cmd_setmedia(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Admin: /setmedia video|image  -> choose Kelly.mp4 or Kelly.jpeg for buy alerts."""
+    """Admin:
+    /setmedia video|image        -> Kelly.mp4 / Kelly.jpeg from assets
+    /setmedia (replying to a photo or video) -> use THAT media (by Telegram file_id, no assets needed)
+    /setmedia                    -> show current setting"""
     if not update.effective_user or not update.message:
         return
     if ADMIN_ID and update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("Not allowed.")
         return
+
+    # Reply-to-media mode: capture file_id of the replied photo/video/animation
+    rep = update.message.reply_to_message
+    if rep and not context.args:
+        fid, mkind = None, None
+        if rep.video:
+            fid, mkind = rep.video.file_id, "video"
+        elif rep.animation:
+            fid, mkind = rep.animation.file_id, "video"
+        elif rep.photo:
+            fid, mkind = rep.photo[-1].file_id, "image"
+        elif rep.document and (rep.document.mime_type or "").startswith(("video/", "image/")):
+            fid = rep.document.file_id
+            mkind = "video" if rep.document.mime_type.startswith("video/") else "image"
+        if not fid:
+            await update.message.reply_text("Reply to a photo or video with /setmedia to use it.")
+            return
+        custom = {"kind": mkind, "file_id": fid}
+        _update_state_fields(lambda s: (s.__setitem__("buy_media_custom", custom), s.__setitem__("buy_media", "custom")))
+        await update.message.reply_text(f"OK. Buy alerts now use this {mkind} (custom). Use /setmedia video|image to go back to assets.")
+        return
+
     arg = (context.args[0].strip().lower() if context.args else "")
     if arg in ("mp4", "vid"):
         arg = "video"
     if arg in ("jpg", "jpeg", "png", "photo", "img"):
         arg = "image"
-    if arg not in ("video", "image"):
-        cur = _load_state().get("buy_media", "video")
+    if arg not in ("video", "image", "custom"):
+        st = _load_state()
+        cur = st.get("buy_media", "video")
+        has_custom = bool((st.get("buy_media_custom") or {}).get("file_id"))
         await update.message.reply_text(
-            f"Usage: /setmedia video|image\nCurrent: {cur}\n"
-            f"video = {ASSET_BUY_VIDEO} ({'ok' if os.path.exists(ASSET_BUY_VIDEO) else 'MISSING'})\n"
-            f"image = {ASSET_BUY_IMAGE} ({'ok' if os.path.exists(ASSET_BUY_IMAGE) else 'MISSING'})"
+            f"Usage: /setmedia video|image, or reply to a photo/video with /setmedia\n"
+            f"Current: {cur}\n"
+            f"video = {ASSET_BUY_VIDEO} ({'ok' if (ASSET_BUY_VIDEO in _MEDIA_BYTES or os.path.exists(ASSET_BUY_VIDEO)) else 'MISSING'})\n"
+            f"image = {ASSET_BUY_IMAGE} ({'ok' if (ASSET_BUY_IMAGE in _MEDIA_BYTES or os.path.exists(ASSET_BUY_IMAGE)) else 'MISSING'})\n"
+            f"custom = {'set' if has_custom else 'none'}"
         )
         return
+    if arg == "custom" and not (_load_state().get("buy_media_custom") or {}).get("file_id"):
+        await update.message.reply_text("No custom media saved. Reply to a photo/video with /setmedia first.")
+        return
     _update_state_fields(lambda s: s.__setitem__("buy_media", arg))
+    if arg == "custom":
+        await update.message.reply_text("OK. Buy alerts now use the custom media.")
+        return
     path = ASSET_BUY_VIDEO if arg == "video" else ASSET_BUY_IMAGE
-    warn = "" if os.path.exists(path) else f"\n⚠️ {path} not found, will fall back."
+    warn = "" if (path in _MEDIA_BYTES or os.path.exists(path)) else f"\n⚠️ {path} not found, will fall back."
     await update.message.reply_text(f"OK. Buy alerts now use {arg} ({path}).{warn}")
 
 
@@ -1515,8 +1603,9 @@ def _help_text() -> str:
     lines.append("/alerts on|off")
     lines.append("Enable or disable DM alerts to the admin")
     lines.append("")
-    lines.append("/setmedia video|image")
-    lines.append("Buy alert media: Kelly.mp4 or Kelly.jpeg (admin)")
+    lines.append("/setmedia video|image|custom")
+    lines.append("Buy alert media: Kelly.mp4 / Kelly.jpeg (admin)")
+    lines.append("Reply to a photo or video with /setmedia to use that one instead")
     lines.append("")
     lines.append("/cancel")
     lines.append("Cancel any running tasks")
@@ -2804,6 +2893,7 @@ async def monitor(app) -> None:
 
 
 async def post_init(app) -> None:
+    _preload_buy_media()
     try:
         if ADMIN_ID:
             mode = "test mode" if ALLOWED_CHAT_ID == 0 else "group mode"
