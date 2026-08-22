@@ -111,7 +111,9 @@ CHAINLINK_ETH_USD_FEED = os.environ.get(
     "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70"
 ).strip()
 
-ASSET_BUY = os.environ.get("ASSET_BUY", "assets/buy.png")
+ASSET_BUY_VIDEO = os.environ.get("ASSET_BUY_VIDEO", "assets/Kelly.mp4")
+ASSET_BUY_IMAGE = os.environ.get("ASSET_BUY_IMAGE", os.environ.get("ASSET_BUY", "assets/Kelly.jpeg"))
+ASSET_BUY = ASSET_BUY_IMAGE  # legacy alias
 ASSET_STAKE = os.environ.get("ASSET_STAKE", "assets/stake.png")
 ASSET_BURN = os.environ.get("ASSET_BURN", "assets/burn.png")
 
@@ -159,6 +161,7 @@ DEFAULT_STATE: Dict[str, Any] = {
     "min_usd": {"buy": 100.0, "stake": 100.0, "burn": 100.0},
     "emoji_usd": {"buy": 100.0, "stake": 100.0, "burn": 100.0},
     "alerts_dm": True,
+    "buy_media": "video",  # "video" -> assets/Kelly.mp4, "image" -> assets/Kelly.jpeg (change with /setmedia)
     "watch": {
         "last_scanned_block": 0,
         "seen": {"buy": [], "stake": [], "burn": []},
@@ -1353,29 +1356,65 @@ def _classify_transfer_log(log: Dict[str, Any]) -> Optional[Tuple[str, str, str,
 # =========================
 
 async def _send_photo_or_text(app, chat_id: int, kind: str, caption: str) -> None:
-    path = None
+    """Send the alert with its media. For buys the media is chosen by state["buy_media"]:
+    "video" -> ASSET_BUY_VIDEO (Kelly.mp4), "image" -> ASSET_BUY_IMAGE (Kelly.jpeg).
+    Falls back video -> image -> plain text if a file is missing."""
     if kind == "buy":
-        path = ASSET_BUY
-    elif kind == "stake":
-        path = ASSET_STAKE
-    elif kind == "burn":
-        path = ASSET_BURN
+        try:
+            mode = str(_load_state().get("buy_media") or "video").lower()
+        except Exception:
+            mode = "video"
+        candidates = [("video", ASSET_BUY_VIDEO), ("image", ASSET_BUY_IMAGE)]
+        if mode == "image":
+            candidates.reverse()
+        for media_kind, path in candidates:
+            if not path or not os.path.exists(path):
+                continue
+            try:
+                with open(path, "rb") as f:
+                    if media_kind == "video":
+                        await app.bot.send_video(chat_id=chat_id, video=f, caption=caption, parse_mode="HTML", supports_streaming=True)
+                    else:
+                        await app.bot.send_photo(chat_id=chat_id, photo=f, caption=caption, parse_mode="HTML")
+                return
+            except Exception as e:
+                print(f"[send_alert] failed sending {media_kind} {path}: {e!r}")
+                continue
+        await app.bot.send_message(chat_id=chat_id, text=caption, parse_mode="HTML", disable_web_page_preview=True)
+        return
 
+    path = ASSET_STAKE if kind == "stake" else (ASSET_BURN if kind == "burn" else None)
     if path and os.path.exists(path):
         with open(path, "rb") as f:
-            await app.bot.send_photo(
-                chat_id=chat_id,
-                photo=f,
-                caption=caption,
-                parse_mode="HTML",
-            )
+            await app.bot.send_photo(chat_id=chat_id, photo=f, caption=caption, parse_mode="HTML")
     else:
-        await app.bot.send_message(
-            chat_id=chat_id,
-            text=caption,
-            parse_mode="HTML",
-            disable_web_page_preview=True,
+        await app.bot.send_message(chat_id=chat_id, text=caption, parse_mode="HTML", disable_web_page_preview=True)
+
+
+async def cmd_setmedia(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin: /setmedia video|image  -> choose Kelly.mp4 or Kelly.jpeg for buy alerts."""
+    if not update.effective_user or not update.message:
+        return
+    if ADMIN_ID and update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("Not allowed.")
+        return
+    arg = (context.args[0].strip().lower() if context.args else "")
+    if arg in ("mp4", "vid"):
+        arg = "video"
+    if arg in ("jpg", "jpeg", "png", "photo", "img"):
+        arg = "image"
+    if arg not in ("video", "image"):
+        cur = _load_state().get("buy_media", "video")
+        await update.message.reply_text(
+            f"Usage: /setmedia video|image\nCurrent: {cur}\n"
+            f"video = {ASSET_BUY_VIDEO} ({'ok' if os.path.exists(ASSET_BUY_VIDEO) else 'MISSING'})\n"
+            f"image = {ASSET_BUY_IMAGE} ({'ok' if os.path.exists(ASSET_BUY_IMAGE) else 'MISSING'})"
         )
+        return
+    _update_state_fields(lambda s: s.__setitem__("buy_media", arg))
+    path = ASSET_BUY_VIDEO if arg == "video" else ASSET_BUY_IMAGE
+    warn = "" if os.path.exists(path) else f"\n⚠️ {path} not found, will fall back."
+    await update.message.reply_text(f"OK. Buy alerts now use {arg} ({path}).{warn}")
 
 
 def _payment_line(kind: str, pay: Optional[Dict[str, float]]) -> str:
@@ -1475,6 +1514,9 @@ def _help_text() -> str:
     lines.append("")
     lines.append("/alerts on|off")
     lines.append("Enable or disable DM alerts to the admin")
+    lines.append("")
+    lines.append("/setmedia video|image")
+    lines.append("Buy alert media: Kelly.mp4 or Kelly.jpeg (admin)")
     lines.append("")
     lines.append("/cancel")
     lines.append("Cancel any running tasks")
@@ -2787,6 +2829,7 @@ def main() -> None:
     app.add_handler(CommandHandler("setmin", cmd_setmin))
     app.add_handler(CommandHandler("setemoji", cmd_setemoji))
     app.add_handler(CommandHandler("alerts", cmd_alerts))
+    app.add_handler(CommandHandler("setmedia", cmd_setmedia))
     app.add_handler(CommandHandler("scan", cmd_scan))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("burned", cmd_burned))
