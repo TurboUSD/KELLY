@@ -158,7 +158,7 @@ def _track_task(name: str, task: asyncio.Task) -> asyncio.Task:
 # =========================
 
 DEFAULT_STATE: Dict[str, Any] = {
-    "min_usd": {"buy": 1000.0, "stake": 100.0, "burn": 100.0},
+    "min_usd": {"buy": 10000.0, "stake": 100.0, "burn": 100.0},
     "emoji_usd": {"buy": 100.0, "stake": 100.0, "burn": 100.0},
     "alerts_dm": True,
     "buy_media": "video",  # "video" -> assets/Kelly.mp4, "image" -> assets/Kelly.jpeg (change with /setmedia)
